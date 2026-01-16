@@ -1,4 +1,4 @@
-# Torrent Study
+# Vibe Torrent Client
 
 A complete BitTorrent implementation in Python, including a `.torrent` file parser and a full-featured BitTorrent client.
 
