@@ -21,19 +21,34 @@ logger = logging.getLogger(__name__)
 class TorrentClient:
     """Main BitTorrent client."""
 
-    def __init__(self, torrent_path: str, output_dir: str = "./downloads") -> None:
+    def __init__(
+        self,
+        torrent_path: str | None = None,
+        output_dir: str = "./downloads",
+        parser: TorrentParser | None = None,
+        info_hash: bytes | None = None,
+    ) -> None:
         """
         Initialize torrent client.
 
         Args:
-            torrent_path: Path to .torrent file
+            torrent_path: Path to .torrent file (optional if parser is provided)
             output_dir: Directory to save downloaded files
+            parser: Pre-configured TorrentParser (for magnet links)
+            info_hash: Pre-computed info hash (for magnet links)
         """
         self.torrent_path = torrent_path
         self.output_dir = Path(output_dir)
-        self.parser = TorrentParser(torrent_path)
+
+        if parser is not None:
+            self.parser = parser
+        elif torrent_path is not None:
+            self.parser = TorrentParser(torrent_path)
+        else:
+            raise ValueError("Either torrent_path or parser must be provided")
+
         self.torrent: Torrent | None = None
-        self.info_hash: bytes = b""
+        self.info_hash: bytes = info_hash or b""
         self.peer_id: bytes = generate_peer_id()
         self.port = 6881
 
@@ -73,9 +88,15 @@ class TorrentClient:
         """Start the torrent client."""
         logger.info("Starting torrent client...")
 
-        # Parse torrent file
-        self.torrent = self.parser.parse()
-        self.info_hash = bytes.fromhex(self.parser.get_info_hash())
+        # Parse torrent file (if not already parsed from magnet)
+        if self.parser._torrent is None:
+            self.torrent = self.parser.parse()
+        else:
+            self.torrent = self.parser._torrent
+
+        # Get info hash (may be pre-set from magnet link)
+        if not self.info_hash:
+            self.info_hash = bytes.fromhex(self.parser.get_info_hash())
 
         logger.info(f"Torrent: {self.parser.get_name()}")
         logger.info(f"Info Hash: {self.parser.get_info_hash()}")

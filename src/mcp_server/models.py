@@ -44,3 +44,13 @@ class DownloadStatus(BaseModel):
     total_peers: int
     download_speed: str | None = None
     error_message: str | None = None
+
+
+class MagnetInfo(BaseModel):
+    """Information parsed from a magnet link."""
+
+    info_hash: str
+    display_name: str | None = None
+    trackers: list[str] = []
+    exact_length: int | None = None
+    web_seeds: list[str] = []

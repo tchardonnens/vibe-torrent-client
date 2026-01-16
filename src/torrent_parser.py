@@ -244,20 +244,21 @@ class Torrent(BaseModel):
 class TorrentParser:
     """Parser for .torrent files using bencode format."""
 
-    def __init__(self, torrent_path: str | Path) -> None:
+    def __init__(self, torrent_path: str | Path | None = None) -> None:
         """
         Initialize the parser with a torrent file path.
 
         Args:
-            torrent_path: Path to the .torrent file
+            torrent_path: Path to the .torrent file (optional for magnet links)
         """
-        self.torrent_path = Path(torrent_path)
-        if not self.torrent_path.exists():
+        self.torrent_path = Path(torrent_path) if torrent_path else None
+        if self.torrent_path and not self.torrent_path.exists():
             raise FileNotFoundError(f"Torrent file not found: {torrent_path}")
 
         self._raw_data: bytes = b""
         self._raw_dict: dict[str, Any] | None = None
         self._torrent: Torrent | None = None
+        self._info_hash_override: bytes | None = None
 
     def parse(self) -> Torrent:
         """
@@ -266,6 +267,9 @@ class TorrentParser:
         Returns:
             Torrent model containing all parsed data
         """
+        if self.torrent_path is None:
+            raise BencodeError("No torrent file path specified")
+
         with open(self.torrent_path, "rb") as f:
             self._raw_data = f.read()
 
@@ -275,6 +279,45 @@ class TorrentParser:
 
         self._raw_dict = data
         self._torrent = Torrent.model_validate(data)
+        return self._torrent
+
+    def parse_from_metadata(
+        self, metadata: bytes, trackers: list[str] | None = None, info_hash: bytes | None = None
+    ) -> Torrent:
+        """
+        Parse torrent metadata from bytes (used for magnet links).
+
+        Args:
+            metadata: Bencoded info dictionary bytes
+            trackers: Optional list of tracker URLs
+            info_hash: Optional pre-computed info hash for verification
+
+        Returns:
+            Torrent model containing parsed data
+        """
+        # Decode the info dictionary
+        info_dict, _ = self._decode_bencode(metadata, 0)
+        if not isinstance(info_dict, dict):
+            raise BencodeError("Metadata must be a dictionary")
+
+        # Verify hash if provided
+        if info_hash:
+            computed_hash = hashlib.sha1(metadata).digest()
+            if computed_hash != info_hash:
+                raise BencodeError("Info hash verification failed")
+            self._info_hash_override = info_hash
+
+        # Build a complete torrent dict
+        torrent_dict: dict[str, Any] = {"info": info_dict}
+
+        # Add trackers
+        if trackers:
+            torrent_dict["announce"] = trackers[0]
+            if len(trackers) > 1:
+                torrent_dict["announce-list"] = [[tr] for tr in trackers]
+
+        self._raw_dict = torrent_dict
+        self._torrent = Torrent.model_validate(torrent_dict)
         return self._torrent
 
     @property
@@ -399,6 +442,9 @@ class TorrentParser:
         Returns:
             Hexadecimal string of the info hash
         """
+        if self._info_hash_override:
+            return self._info_hash_override.hex()
+
         if self._raw_dict is None:
             self.parse()
 
@@ -416,6 +462,9 @@ class TorrentParser:
         Returns:
             Raw bytes of the info hash (20 bytes)
         """
+        if self._info_hash_override:
+            return self._info_hash_override
+
         if self._raw_dict is None:
             self.parse()
 
