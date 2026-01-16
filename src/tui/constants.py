@@ -5,7 +5,7 @@ Color pair constants for the TUI.
 
 class ColorPairs:
     """Color pair IDs for curses."""
-    
+
     TITLE = 1
     PROGRESS = 2
     STATS = 3

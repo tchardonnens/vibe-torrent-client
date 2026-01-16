@@ -13,15 +13,12 @@ if TYPE_CHECKING:
 
 class TUILogHandler(logging.Handler):
     """Custom log handler that captures logs for the TUI."""
-    
-    def __init__(self, tui: "TorrentTUI") -> None:
+
+    def __init__(self, tui: TorrentTUI) -> None:
         super().__init__()
         self.tui = tui
-        self.setFormatter(logging.Formatter(
-            "%(asctime)s │ %(levelname)-7s │ %(message)s",
-            datefmt="%H:%M:%S"
-        ))
-    
+        self.setFormatter(logging.Formatter("%(asctime)s │ %(levelname)-7s │ %(message)s", datefmt="%H:%M:%S"))
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
