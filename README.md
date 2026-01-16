@@ -31,7 +31,7 @@ python torrent_parser.py <torrent_file>
 
 Example:
 ```bash
-python torrent_parser.py Skyfall.2012.2160p.UHD.BluRay.X265-IAMABLE.torrent
+python torrent_parser.py foobar.torrent
 ```
 
 ### Python API
