@@ -4,19 +4,22 @@ File manager for writing downloaded pieces to disk.
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    from torrent_parser import TorrentFile
 
 
 class FileManager:
     """Manages writing downloaded pieces to files."""
     
-    def __init__(self, output_dir: Path, files: List[Dict[str, any]], piece_length: int) -> None:
+    def __init__(self, output_dir: Path, files: List["TorrentFile"], piece_length: int) -> None:
         """
         Initialize file manager.
         
         Args:
             output_dir: Directory to write files to
-            files: List of file dictionaries with 'length' and 'path' keys
+            files: List of TorrentFile objects
             piece_length: Length of each piece in bytes
         """
         self.output_dir = Path(output_dir)
@@ -37,8 +40,8 @@ class FileManager:
         current_offset = 0
         
         for file_info in self.files:
-            file_path = self.output_dir / '/'.join(file_info['path'])
-            file_length = file_info['length']
+            file_path = self.output_dir / file_info.full_path
+            file_length = file_info.length
             
             # Calculate which pieces overlap with this file
             file_start = current_offset
