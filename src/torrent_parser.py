@@ -1,158 +1,380 @@
 """
 A .torrent file parser that decodes bencoded data and extracts torrent metadata.
+Uses Pydantic for structured data validation and type safety.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Union
-from pathlib import Path
+from __future__ import annotations
+
 import hashlib
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 
 class BencodeError(Exception):
     """Exception raised for bencode parsing errors."""
+
     pass
+
+
+class TorrentFile(BaseModel):
+    """Represents a single file in a torrent."""
+
+    length: int = Field(ge=0, description="File size in bytes")
+    path: list[str] = Field(description="Path components for the file")
+
+    @computed_field
+    @property
+    def full_path(self) -> str:
+        """Get the full path as a string."""
+        return "/".join(self.path)
+
+    def format_size(self) -> str:
+        """Format the file size as human-readable string."""
+        return _format_size(self.length)
+
+
+class TorrentInfo(BaseModel):
+    """The 'info' dictionary from a torrent file."""
+
+    name: str = Field(description="Name of the torrent (file or directory)")
+    piece_length: int = Field(alias="piece length", ge=1, description="Size of each piece in bytes")
+    pieces: bytes = Field(description="Concatenated SHA-1 hashes of all pieces")
+    length: int | None = Field(default=None, ge=0, description="Total length for single-file torrents")
+    files: list[TorrentFile] | None = Field(default=None, description="List of files for multi-file torrents")
+    private: int | None = Field(default=None, description="Private torrent flag")
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def decode_bytes_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """Decode bytes fields to strings where appropriate."""
+        if isinstance(data.get("name"), bytes):
+            data["name"] = data["name"].decode("utf-8", errors="replace")
+
+        # Handle files list - only process if they are raw dicts from bencode parsing
+        if "files" in data and data["files"]:
+            decoded_files = []
+            for file_info in data["files"]:
+                # Skip if already a TorrentFile instance
+                if isinstance(file_info, TorrentFile):
+                    decoded_files.append(file_info)
+                    continue
+
+                path = file_info.get("path", [])
+                if isinstance(path, list):
+                    path = [p.decode("utf-8", errors="replace") if isinstance(p, bytes) else str(p) for p in path]
+                decoded_files.append({"length": file_info.get("length", 0), "path": path})
+            data["files"] = decoded_files
+
+        return data
+
+    @computed_field
+    @property
+    def piece_count(self) -> int:
+        """Get the number of pieces (each SHA-1 hash is 20 bytes)."""
+        return len(self.pieces) // 20
+
+    @computed_field
+    @property
+    def total_size(self) -> int:
+        """Get the total size of all files."""
+        if self.length is not None:
+            return self.length
+        if self.files:
+            return sum(f.length for f in self.files)
+        return 0
+
+    @computed_field
+    @property
+    def is_single_file(self) -> bool:
+        """Check if this is a single-file torrent."""
+        return self.length is not None
+
+    def get_files(self) -> list[TorrentFile]:
+        """Get the list of files in the torrent."""
+        if self.files:
+            return self.files
+        # Single file torrent
+        return [TorrentFile(length=self.length or 0, path=[self.name])]
+
+    def get_piece_hash(self, piece_index: int) -> bytes:
+        """Get the SHA-1 hash for a specific piece."""
+        if piece_index < 0 or piece_index >= self.piece_count:
+            raise IndexError(f"Piece index {piece_index} out of range (0-{self.piece_count - 1})")
+        start = piece_index * 20
+        return self.pieces[start : start + 20]
+
+
+class Torrent(BaseModel):
+    """Complete torrent metadata."""
+
+    info: TorrentInfo = Field(description="The info dictionary")
+    announce: str | None = Field(default=None, description="Primary tracker URL")
+    announce_list: list[list[str]] | None = Field(
+        default=None, alias="announce-list", description="Tiered list of tracker URLs"
+    )
+    creation_date: int | None = Field(default=None, alias="creation date", description="Creation timestamp")
+    comment: str | None = Field(default=None, description="Optional comment")
+    created_by: str | None = Field(default=None, alias="created by", description="Creator software")
+    encoding: str | None = Field(default=None, description="String encoding used")
+
+    # Store raw info dict for hash calculation
+    _raw_info: dict[str, Any] | None = None
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def decode_bytes_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """Decode bytes fields to strings where appropriate."""
+        if isinstance(data.get("announce"), bytes):
+            data["announce"] = data["announce"].decode("utf-8", errors="replace")
+
+        if isinstance(data.get("comment"), bytes):
+            data["comment"] = data["comment"].decode("utf-8", errors="replace")
+
+        if isinstance(data.get("created by"), bytes):
+            data["created by"] = data["created by"].decode("utf-8", errors="replace")
+
+        if isinstance(data.get("encoding"), bytes):
+            data["encoding"] = data["encoding"].decode("utf-8", errors="replace")
+
+        # Handle announce-list (list of lists of bytes)
+        if "announce-list" in data and data["announce-list"]:
+            decoded_list = []
+            for tier in data["announce-list"]:
+                if isinstance(tier, list):
+                    decoded_tier = []
+                    for url in tier:
+                        if isinstance(url, bytes):
+                            decoded_tier.append(url.decode("utf-8", errors="replace"))
+                        else:
+                            decoded_tier.append(str(url))
+                    decoded_list.append(decoded_tier)
+            data["announce-list"] = decoded_list
+
+        return data
+
+    @computed_field
+    @property
+    def name(self) -> str:
+        """Get the torrent name."""
+        return self.info.name
+
+    @computed_field
+    @property
+    def total_size(self) -> int:
+        """Get total size in bytes."""
+        return self.info.total_size
+
+    @computed_field
+    @property
+    def piece_length(self) -> int:
+        """Get piece length in bytes."""
+        return self.info.piece_length
+
+    @computed_field
+    @property
+    def piece_count(self) -> int:
+        """Get number of pieces."""
+        return self.info.piece_count
+
+    @computed_field
+    @property
+    def creation_datetime(self) -> datetime | None:
+        """Get creation date as datetime object."""
+        if self.creation_date:
+            return datetime.fromtimestamp(self.creation_date)
+        return None
+
+    def get_announce_urls(self) -> list[str]:
+        """Get all unique announce URLs."""
+        urls: list[str] = []
+
+        if self.announce:
+            urls.append(self.announce)
+
+        if self.announce_list:
+            for tier in self.announce_list:
+                for url in tier:
+                    if url not in urls:
+                        urls.append(url)
+
+        return urls
+
+    def get_files(self) -> list[TorrentFile]:
+        """Get the list of files."""
+        return self.info.get_files()
+
+    def format_size(self) -> str:
+        """Format total size as human-readable string."""
+        return _format_size(self.total_size)
+
+    def print_summary(self) -> None:
+        """Print a human-readable summary of the torrent."""
+        print(f"Torrent: {self.name}")
+        print(f"Total Size: {self.format_size()}")
+        print(f"Piece Length: {_format_size(self.piece_length)}")
+        print(f"Number of Pieces: {self.piece_count}")
+
+        if self.creation_datetime:
+            print(f"Creation Date: {self.creation_datetime}")
+
+        if self.created_by:
+            print(f"Created By: {self.created_by}")
+
+        if self.comment:
+            print(f"Comment: {self.comment}")
+
+        urls = self.get_announce_urls()
+        print(f"\nAnnounce URLs ({len(urls)}):")
+        for url in urls:
+            print(f"  - {url}")
+
+        files = self.get_files()
+        print(f"\nFiles ({len(files)}):")
+        for i, file in enumerate(files, 1):
+            print(f"  {i}. {file.full_path} ({file.format_size()})")
 
 
 class TorrentParser:
     """Parser for .torrent files using bencode format."""
-    
-    def __init__(self, torrent_path: Union[str, Path]) -> None:
+
+    def __init__(self, torrent_path: str | Path) -> None:
         """
         Initialize the parser with a torrent file path.
-        
+
         Args:
             torrent_path: Path to the .torrent file
         """
         self.torrent_path = Path(torrent_path)
         if not self.torrent_path.exists():
             raise FileNotFoundError(f"Torrent file not found: {torrent_path}")
-        
-        self.data: Optional[Dict[str, Any]] = None
+
         self._raw_data: bytes = b""
-    
-    def parse(self) -> Dict[str, Any]:
+        self._raw_dict: dict[str, Any] | None = None
+        self._torrent: Torrent | None = None
+
+    def parse(self) -> Torrent:
         """
-        Parse the torrent file and return the decoded data.
-        
+        Parse the torrent file and return a Torrent model.
+
         Returns:
-            Dictionary containing the parsed torrent data
+            Torrent model containing all parsed data
         """
-        with open(self.torrent_path, 'rb') as f:
+        with open(self.torrent_path, "rb") as f:
             self._raw_data = f.read()
-        
-        self.data, _ = self._decode_bencode(self._raw_data, 0)
-        if not isinstance(self.data, dict):
+
+        data, _ = self._decode_bencode(self._raw_data, 0)
+        if not isinstance(data, dict):
             raise BencodeError("Torrent file must start with a dictionary")
-        
-        return self.data
-    
-    def _decode_bencode(self, data: bytes, index: int) -> Tuple[Any, int]:
+
+        self._raw_dict = data
+        self._torrent = Torrent.model_validate(data)
+        return self._torrent
+
+    @property
+    def torrent(self) -> Torrent:
+        """Get the parsed Torrent model, parsing if needed."""
+        if self._torrent is None:
+            self.parse()
+        return self._torrent  # type: ignore
+
+    def _decode_bencode(self, data: bytes, index: int) -> tuple[Any, int]:
         """
         Decode bencoded data recursively.
-        
+
         Args:
             data: The raw bytes to decode
             index: Current position in the data
-            
+
         Returns:
             Tuple of (decoded_value, new_index)
         """
         if index >= len(data):
             raise BencodeError(f"Unexpected end of data at index {index}")
-        
-        char = data[index:index+1]
-        
+
+        char = data[index : index + 1]
+
         # Integer: i<number>e
-        if char == b'i':
-            end_index = data.find(b'e', index + 1)
+        if char == b"i":
+            end_index = data.find(b"e", index + 1)
             if end_index == -1:
                 raise BencodeError(f"Unterminated integer at index {index}")
             try:
-                value = int(data[index + 1:end_index])
+                value = int(data[index + 1 : end_index])
                 return value, end_index + 1
             except ValueError:
                 raise BencodeError(f"Invalid integer at index {index}")
-        
+
         # List: l<elements>e
-        elif char == b'l':
+        elif char == b"l":
             index += 1
-            result: List[Any] = []
-            while index < len(data) and data[index:index+1] != b'e':
+            result: list[Any] = []
+            while index < len(data) and data[index : index + 1] != b"e":
                 value, index = self._decode_bencode(data, index)
                 result.append(value)
             if index >= len(data):
                 raise BencodeError(f"Unterminated list at index {index}")
             return result, index + 1
-        
+
         # Dictionary: d<key-value pairs>e
-        elif char == b'd':
+        elif char == b"d":
             index += 1
-            result: Dict[Any, Any] = {}
-            while index < len(data) and data[index:index+1] != b'e':
+            result_dict: dict[Any, Any] = {}
+            while index < len(data) and data[index : index + 1] != b"e":
                 key, index = self._decode_bencode(data, index)
                 value, index = self._decode_bencode(data, index)
                 # Convert dictionary keys from bytes to strings (bencode spec)
                 if isinstance(key, bytes):
-                    key = key.decode('utf-8', errors='replace')
-                result[key] = value
+                    key = key.decode("utf-8", errors="replace")
+                result_dict[key] = value
             if index >= len(data):
                 raise BencodeError(f"Unterminated dictionary at index {index}")
-            return result, index + 1
-        
+            return result_dict, index + 1
+
         # String: <length>:<data>
         elif char.isdigit():
-            colon_index = data.find(b':', index)
+            colon_index = data.find(b":", index)
             if colon_index == -1:
                 raise BencodeError(f"No colon found for string at index {index}")
             try:
                 length = int(data[index:colon_index])
             except ValueError:
                 raise BencodeError(f"Invalid string length at index {index}")
-            
+
             start_index = colon_index + 1
             end_index = start_index + length
             if end_index > len(data):
                 raise BencodeError(f"String length exceeds data at index {index}")
-            
+
             value = data[start_index:end_index]
             return value, end_index
-        
+
         else:
             raise BencodeError(f"Unexpected character '{char.decode('latin-1', errors='replace')}' at index {index}")
-    
-    def get_info_hash(self) -> str:
-        """
-        Calculate and return the SHA-1 hash of the 'info' dictionary.
-        
-        Returns:
-            Hexadecimal string of the info hash
-        """
-        if self.data is None:
-            self.parse()
-        
-        if 'info' not in self.data:
-            raise ValueError("Torrent file missing 'info' dictionary")
-        
-        # Re-encode the info dictionary to calculate its hash
-        info_bytes = self._encode_bencode(self.data['info'])
-        return hashlib.sha1(info_bytes).hexdigest()
-    
+
     def _encode_bencode(self, value: Any) -> bytes:
         """
         Encode a Python value to bencode format.
-        
+
         Args:
             value: The value to encode
-            
+
         Returns:
             Bencoded bytes
         """
         if isinstance(value, int):
-            return f"i{value}e".encode('utf-8')
+            return f"i{value}e".encode("utf-8")
         elif isinstance(value, bytes):
-            return f"{len(value)}:".encode('utf-8') + value
+            return f"{len(value)}:".encode("utf-8") + value
         elif isinstance(value, str):
-            value_bytes = value.encode('utf-8')
-            return f"{len(value_bytes)}:".encode('utf-8') + value_bytes
+            value_bytes = value.encode("utf-8")
+            return f"{len(value_bytes)}:".encode("utf-8") + value_bytes
         elif isinstance(value, list):
             result = b"l"
             for item in value:
@@ -169,262 +391,122 @@ class TorrentParser:
             return result
         else:
             raise BencodeError(f"Cannot encode type: {type(value)}")
-    
-    def get_announce_urls(self) -> List[str]:
+
+    def get_info_hash(self) -> str:
         """
-        Get all announce URLs from the torrent.
-        
+        Calculate and return the SHA-1 hash of the 'info' dictionary.
+
         Returns:
-            List of announce URLs
+            Hexadecimal string of the info hash
         """
-        if self.data is None:
+        if self._raw_dict is None:
             self.parse()
-        
-        urls: List[str] = []
-        
-        # Single announce URL
-        if 'announce' in self.data:
-            url = self.data['announce']
-            if isinstance(url, bytes):
-                urls.append(url.decode('utf-8', errors='replace'))
-            else:
-                urls.append(str(url))
-        
-        # Announce list (list of lists)
-        if 'announce-list' in self.data:
-            for tier in self.data['announce-list']:
-                if isinstance(tier, list):
-                    for url in tier:
-                        if isinstance(url, bytes):
-                            url_str = url.decode('utf-8', errors='replace')
-                        else:
-                            url_str = str(url)
-                        if url_str not in urls:
-                            urls.append(url_str)
-        
-        return urls
-    
-    def get_files(self) -> List[Dict[str, Any]]:
+
+        if "info" not in self._raw_dict:  # type: ignore
+            raise ValueError("Torrent file missing 'info' dictionary")
+
+        # Re-encode the info dictionary to calculate its hash
+        info_bytes = self._encode_bencode(self._raw_dict["info"])  # type: ignore
+        return hashlib.sha1(info_bytes).hexdigest()
+
+    def get_info_hash_bytes(self) -> bytes:
         """
-        Get list of files in the torrent.
-        
+        Calculate and return the SHA-1 hash of the 'info' dictionary as bytes.
+
         Returns:
-            List of file dictionaries with 'length' and 'path' keys
+            Raw bytes of the info hash (20 bytes)
         """
-        if self.data is None:
+        if self._raw_dict is None:
             self.parse()
-        
-        if 'info' not in self.data:
-            return []
-        
-        info = self.data['info']
-        
-        # Single file torrent
-        if 'length' in info:
-            name = info.get('name', b'').decode('utf-8', errors='replace') if isinstance(info.get('name'), bytes) else str(info.get('name', ''))
-            return [{
-                'length': info['length'],
-                'path': [name]
-            }]
-        
-        # Multi-file torrent
-        if 'files' in info:
-            files = []
-            for file_info in info['files']:
-                path = file_info.get('path', [])
-                if isinstance(path, list):
-                    path = [p.decode('utf-8', errors='replace') if isinstance(p, bytes) else str(p) for p in path]
-                else:
-                    path = [str(path)]
-                
-                files.append({
-                    'length': file_info.get('length', 0),
-                    'path': path
-                })
-            return files
-        
-        return []
-    
+
+        if "info" not in self._raw_dict:  # type: ignore
+            raise ValueError("Torrent file missing 'info' dictionary")
+
+        info_bytes = self._encode_bencode(self._raw_dict["info"])  # type: ignore
+        return hashlib.sha1(info_bytes).digest()
+
+    # Convenience methods that delegate to the Torrent model
+    def get_announce_urls(self) -> list[str]:
+        """Get all announce URLs from the torrent."""
+        return self.torrent.get_announce_urls()
+
+    def get_files(self) -> list[TorrentFile]:
+        """Get list of files in the torrent."""
+        return self.torrent.get_files()
+
     def get_total_size(self) -> int:
-        """
-        Get the total size of all files in the torrent.
-        
-        Returns:
-            Total size in bytes
-        """
-        files = self.get_files()
-        return sum(f['length'] for f in files)
-    
+        """Get the total size of all files in the torrent."""
+        return self.torrent.total_size
+
     def get_piece_length(self) -> int:
-        """
-        Get the piece length (chunk size) for the torrent.
-        
-        Returns:
-            Piece length in bytes
-        """
-        if self.data is None:
-            self.parse()
-        
-        if 'info' not in self.data:
-            return 0
-        
-        return self.data['info'].get('piece length', 0)
-    
+        """Get the piece length (chunk size) for the torrent."""
+        return self.torrent.piece_length
+
     def get_piece_count(self) -> int:
-        """
-        Get the number of pieces in the torrent.
-        
-        Returns:
-            Number of pieces
-        """
-        if self.data is None:
-            self.parse()
-        
-        if 'info' not in self.data or 'pieces' not in self.data['info']:
-            return 0
-        
-        pieces = self.data['info']['pieces']
-        if isinstance(pieces, bytes):
-            # Each piece hash is 20 bytes (SHA-1)
-            return len(pieces) // 20
-        
-        return 0
-    
+        """Get the number of pieces in the torrent."""
+        return self.torrent.piece_count
+
     def get_name(self) -> str:
-        """
-        Get the name of the torrent.
-        
-        Returns:
-            Torrent name
-        """
-        if self.data is None:
-            self.parse()
-        
-        if 'info' not in self.data:
-            return ""
-        
-        name = self.data['info'].get('name', b'')
-        if isinstance(name, bytes):
-            return name.decode('utf-8', errors='replace')
-        return str(name)
-    
-    def get_creation_date(self) -> Optional[int]:
-        """
-        Get the creation date of the torrent (Unix timestamp).
-        
-        Returns:
-            Creation date timestamp or None if not present
-        """
-        if self.data is None:
-            self.parse()
-        
-        return self.data.get('creation date')
-    
-    def get_comment(self) -> Optional[str]:
-        """
-        Get the comment from the torrent.
-        
-        Returns:
-            Comment string or None if not present
-        """
-        if self.data is None:
-            self.parse()
-        
-        comment = self.data.get('comment')
-        if comment is None:
-            return None
-        
-        if isinstance(comment, bytes):
-            return comment.decode('utf-8', errors='replace')
-        return str(comment)
-    
-    def get_created_by(self) -> Optional[str]:
-        """
-        Get the 'created by' field from the torrent.
-        
-        Returns:
-            Created by string or None if not present
-        """
-        if self.data is None:
-            self.parse()
-        
-        created_by = self.data.get('created by')
-        if created_by is None:
-            return None
-        
-        if isinstance(created_by, bytes):
-            return created_by.decode('utf-8', errors='replace')
-        return str(created_by)
-    
+        """Get the name of the torrent."""
+        return self.torrent.name
+
+    def get_creation_date(self) -> int | None:
+        """Get the creation date of the torrent (Unix timestamp)."""
+        return self.torrent.creation_date
+
+    def get_comment(self) -> str | None:
+        """Get the comment from the torrent."""
+        return self.torrent.comment
+
+    def get_created_by(self) -> str | None:
+        """Get the 'created by' field from the torrent."""
+        return self.torrent.created_by
+
     def print_summary(self) -> None:
-        """
-        Print a human-readable summary of the torrent.
-        """
-        if self.data is None:
-            self.parse()
-        
-        print(f"Torrent: {self.get_name()}")
+        """Print a human-readable summary of the torrent."""
         print(f"Info Hash: {self.get_info_hash()}")
-        print(f"Total Size: {self._format_size(self.get_total_size())}")
-        print(f"Piece Length: {self._format_size(self.get_piece_length())}")
-        print(f"Number of Pieces: {self.get_piece_count()}")
-        
-        creation_date = self.get_creation_date()
-        if creation_date:
-            from datetime import datetime
-            print(f"Creation Date: {datetime.fromtimestamp(creation_date)}")
-        
-        created_by = self.get_created_by()
-        if created_by:
-            print(f"Created By: {created_by}")
-        
-        comment = self.get_comment()
-        if comment:
-            print(f"Comment: {comment}")
-        
-        print(f"\nAnnounce URLs ({len(self.get_announce_urls())}):")
-        for url in self.get_announce_urls():
-            print(f"  - {url}")
-        
-        files = self.get_files()
-        print(f"\nFiles ({len(files)}):")
-        for i, file_info in enumerate(files, 1):
-            path_str = '/'.join(file_info['path'])
-            size = self._format_size(file_info['length'])
-            print(f"  {i}. {path_str} ({size})")
-    
-    @staticmethod
-    def _format_size(size_bytes: int) -> str:
-        """
-        Format bytes into human-readable size.
-        
-        Args:
-            size_bytes: Size in bytes
-            
-        Returns:
-            Formatted size string
-        """
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size_bytes < 1024.0:
-                return f"{size_bytes:.2f} {unit}"
-            size_bytes /= 1024.0
-        return f"{size_bytes:.2f} PB"
+        self.torrent.print_summary()
+
+
+def _format_size(size_bytes: int) -> str:
+    """
+    Format bytes into human-readable size.
+
+    Args:
+        size_bytes: Size in bytes
+
+    Returns:
+        Formatted size string
+    """
+    size = float(size_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} PB"
 
 
 def main() -> None:
     """Example usage of the torrent parser."""
     import sys
-    
+
     if len(sys.argv) < 2:
         print("Usage: python torrent_parser.py <torrent_file>")
         sys.exit(1)
-    
+
     torrent_file = sys.argv[1]
-    
+
     try:
         parser = TorrentParser(torrent_file)
         parser.parse()
         parser.print_summary()
+
+        # Example of accessing structured data
+        print("\n--- Accessing structured data ---")
+        torrent = parser.torrent
+        print(f"Is single file: {torrent.info.is_single_file}")
+        print(f"First file: {torrent.get_files()[0].full_path}")
+
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -432,4 +514,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
