@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from magnet import MagnetLink, is_magnet_link
+from magnet_client import MetadataFetcher
 from torrent_parser import TorrentParser
 
 from ..models import DownloadStatus
@@ -23,8 +25,10 @@ def register_download_tools(mcp) -> None:
         """
         Start downloading a torrent in the background.
 
+        Supports both .torrent file paths and magnet links.
+
         Args:
-            torrent_path: Path to the .torrent file to download.
+            torrent_path: Path to the .torrent file or a magnet link URI.
             output_dir: Directory to save downloaded files.
                         Defaults to 'downloads' folder in the project.
 
@@ -33,10 +37,15 @@ def register_download_tools(mcp) -> None:
         """
         from client import TorrentClient
 
-        path = resolve_torrent_path(torrent_path, DEFAULT_TORRENTS_DIR)
-
         output = Path(output_dir) if output_dir else DEFAULT_DOWNLOADS_DIR
         output.mkdir(parents=True, exist_ok=True)
+
+        # Check if it's a magnet link
+        if is_magnet_link(torrent_path):
+            return await _start_magnet_download(torrent_path, output)
+
+        # Handle regular torrent file
+        path = resolve_torrent_path(torrent_path, DEFAULT_TORRENTS_DIR)
 
         # Parse to get info hash
         parser = TorrentParser(str(path))
@@ -55,7 +64,7 @@ def register_download_tools(mcp) -> None:
                 }
 
         # Create client
-        client = TorrentClient(str(path), str(output))
+        client = TorrentClient(torrent_path=str(path), output_dir=str(output))
 
         # Track the download
         active_downloads[info_hash] = {
@@ -85,6 +94,94 @@ def register_download_tools(mcp) -> None:
             "name": torrent.name,
             "output_dir": str(output),
             "message": f"Started downloading {torrent.name}",
+        }
+
+    async def _start_magnet_download(magnet_uri: str, output: Path) -> dict[str, str]:
+        """
+        Start downloading from a magnet link.
+
+        Args:
+            magnet_uri: The magnet URI
+            output: Output directory
+
+        Returns:
+            Status information
+        """
+        from client import TorrentClient
+
+        # Parse magnet link
+        try:
+            magnet = MagnetLink.parse(magnet_uri)
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to parse magnet link: {e}",
+            }
+
+        info_hash = magnet.info_hash_hex
+        display_name = magnet.display_name or info_hash[:16]
+
+        # Check if already downloading
+        if info_hash in active_downloads:
+            status = active_downloads[info_hash].get("status", "unknown")
+            if status == "downloading":
+                return {
+                    "status": "already_downloading",
+                    "info_hash": info_hash,
+                    "name": display_name,
+                    "message": "This torrent is already being downloaded",
+                }
+
+        # Track as fetching metadata
+        active_downloads[info_hash] = {
+            "client": None,
+            "status": "fetching_metadata",
+            "name": display_name,
+            "magnet_uri": magnet_uri,
+            "output_dir": str(output),
+            "started_at": datetime.now().isoformat(),
+        }
+
+        # Start metadata fetch and download in background
+        async def run_magnet_download() -> None:
+            try:
+                # Fetch metadata
+                fetcher = MetadataFetcher(magnet)
+                metadata = await fetcher.fetch()
+
+                if not metadata:
+                    active_downloads[info_hash]["status"] = "error"
+                    active_downloads[info_hash]["error"] = "Failed to fetch metadata from peers"
+                    return
+
+                # Create parser from metadata
+                parser = TorrentParser()
+                parser.parse_from_metadata(metadata, trackers=magnet.trackers, info_hash=magnet.info_hash)
+
+                # Update name if we got it from metadata
+                if parser._torrent:
+                    active_downloads[info_hash]["name"] = parser._torrent.name
+
+                # Create client
+                client = TorrentClient(parser=parser, output_dir=str(output), info_hash=magnet.info_hash)
+                active_downloads[info_hash]["client"] = client
+                active_downloads[info_hash]["status"] = "downloading"
+
+                await client.start()
+                active_downloads[info_hash]["status"] = "completed"
+
+            except Exception as e:
+                active_downloads[info_hash]["status"] = "error"
+                active_downloads[info_hash]["error"] = str(e)
+
+        asyncio.create_task(run_magnet_download())
+
+        return {
+            "status": "started",
+            "info_hash": info_hash,
+            "name": display_name,
+            "output_dir": str(output),
+            "message": f"Started fetching metadata for {display_name}",
         }
 
     @mcp.tool()

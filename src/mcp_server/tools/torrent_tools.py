@@ -2,9 +2,10 @@
 
 from pathlib import Path
 
+from magnet import MagnetError, MagnetLink, is_magnet_link
 from torrent_parser import BencodeError, TorrentParser
 
-from ..models import TorrentFileInfo, TorrentMetadata
+from ..models import MagnetInfo, TorrentFileInfo, TorrentMetadata
 from ..state import DEFAULT_TORRENTS_DIR
 from ..utils import resolve_torrent_path
 
@@ -155,3 +156,47 @@ def register_torrent_tools(mcp) -> None:
         parser = TorrentParser(str(path))
         torrent = parser.parse()
         return torrent.get_announce_urls()
+
+    @mcp.tool()
+    def parse_magnet_link(
+        magnet_uri: str,
+    ) -> MagnetInfo:
+        """
+        Parse a magnet link and extract its information.
+
+        Magnet links are URIs that identify content by hash rather than location.
+        They contain the info hash and optionally display name and tracker URLs.
+
+        Args:
+            magnet_uri: The magnet URI to parse (starts with "magnet:?").
+
+        Returns:
+            Parsed magnet link information including info hash, name, and trackers.
+        """
+        try:
+            magnet = MagnetLink.parse(magnet_uri)
+
+            return MagnetInfo(
+                info_hash=magnet.info_hash_hex,
+                display_name=magnet.display_name,
+                trackers=magnet.trackers,
+                exact_length=magnet.exact_length,
+                web_seeds=magnet.web_seeds,
+            )
+        except MagnetError as e:
+            raise ValueError(f"Failed to parse magnet link: {e}") from e
+
+    @mcp.tool()
+    def is_magnet(
+        uri: str,
+    ) -> bool:
+        """
+        Check if a string is a valid magnet link.
+
+        Args:
+            uri: The string to check.
+
+        Returns:
+            True if the string is a magnet link, False otherwise.
+        """
+        return is_magnet_link(uri)

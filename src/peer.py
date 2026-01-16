@@ -1,11 +1,16 @@
 """
 BitTorrent peer protocol implementation.
 Handles peer connections, handshakes, and message exchange.
+Supports BEP 9 (Extension for Peers to Send Metadata Files).
 """
 
 import asyncio
+import hashlib
 import struct
 from enum import IntEnum
+from typing import Any
+
+from magnet import bencode_decode, bencode_encode
 
 
 class MessageType(IntEnum):
@@ -21,7 +26,21 @@ class MessageType(IntEnum):
     PIECE = 7
     CANCEL = 8
     PORT = 9
+    EXTENDED = 20  # BEP 10 Extension Protocol
     KEEP_ALIVE = -1  # Special case: no message ID, length = 0
+
+
+# Extension message IDs (BEP 10)
+EXTENSION_HANDSHAKE = 0
+UT_METADATA = 1  # Our local ID for ut_metadata extension
+
+
+class ExtendedMessageType(IntEnum):
+    """Extended message types for ut_metadata (BEP 9)."""
+
+    REQUEST = 0
+    DATA = 1
+    REJECT = 2
 
 
 class PeerError(Exception):
@@ -58,6 +77,12 @@ class Peer:
         self.connected = False
         self.pieces_have: set[int] = set()
         self.counted_pieces: set[int] = set()
+
+        # Extension protocol (BEP 10 / BEP 9)
+        self.supports_extensions = False
+        self.extension_handshake_received = False
+        self.remote_extensions: dict[str, int] = {}  # Extension name -> message ID
+        self.metadata_size: int | None = None  # Size of metadata if peer supports ut_metadata
 
     async def connect(self, timeout: float = 10.0) -> bool:
         """
@@ -97,19 +122,30 @@ class Peer:
         self.reader = None
         self.writer = None
 
-    async def _handshake(self) -> None:
-        """Perform BitTorrent handshake."""
+    async def _handshake(self, support_extensions: bool = False) -> None:
+        """
+        Perform BitTorrent handshake.
+
+        Args:
+            support_extensions: If True, advertise extension protocol support (BEP 10)
+        """
         # Handshake format:
         # <pstrlen><pstr><reserved><info_hash><peer_id>
         # pstr = "BitTorrent protocol"
         # pstrlen = 19
-        # reserved = 8 bytes (all zeros for basic protocol)
+        # reserved = 8 bytes
+        #   - Bit 20 (0x00100000) indicates extension protocol support (BEP 10)
+
+        reserved = bytearray(8)
+        if support_extensions:
+            # Set bit 20 from the right (byte 5, bit 4) to indicate extension support
+            reserved[5] |= 0x10
 
         handshake = struct.pack(
             ">B19s8s20s20s",
             19,  # pstrlen
             b"BitTorrent protocol",  # pstr
-            b"\x00" * 8,  # reserved
+            bytes(reserved),  # reserved
             self.info_hash,
             self.peer_id,
         )
@@ -130,6 +166,10 @@ class Peer:
         pstr = response[1:20]
         if pstr != b"BitTorrent protocol":
             raise PeerError(f"Invalid protocol string: {pstr}")
+
+        # Check if peer supports extensions (bit 20 from right = byte 5, bit 4)
+        remote_reserved = response[20:28]
+        self.supports_extensions = bool(remote_reserved[5] & 0x10)
 
         # Extract info_hash and peer_id
         response_info_hash = response[28:48]
@@ -294,3 +334,243 @@ class Peer:
     async def disconnect(self) -> None:
         """Close connection to peer."""
         await self._safe_close()
+
+    # Extension Protocol (BEP 10) Methods
+
+    async def send_extension_handshake(self, metadata_size: int | None = None) -> None:
+        """
+        Send extension protocol handshake (BEP 10).
+
+        Args:
+            metadata_size: If we have metadata, include its size
+        """
+        # Build extension handshake dictionary
+        handshake_dict: dict[str, Any] = {
+            "m": {
+                "ut_metadata": UT_METADATA,  # Advertise ut_metadata support
+            },
+        }
+
+        if metadata_size is not None:
+            handshake_dict["metadata_size"] = metadata_size
+
+        # Encode the handshake
+        payload = bencode_encode(handshake_dict)
+
+        # Extension message format: <extended_message_id><payload>
+        # For handshake, extended_message_id = 0
+        message = bytes([EXTENSION_HANDSHAKE]) + payload
+        await self.send_message(MessageType.EXTENDED, message)
+
+    async def handle_extension_message(self, payload: bytes) -> tuple[int, dict[str, Any] | bytes]:
+        """
+        Handle an extension protocol message.
+
+        Args:
+            payload: Extension message payload
+
+        Returns:
+            Tuple of (extension_message_id, decoded_payload)
+        """
+        if len(payload) < 1:
+            raise PeerError("Empty extension message")
+
+        ext_msg_id = payload[0]
+        ext_payload = payload[1:]
+
+        if ext_msg_id == EXTENSION_HANDSHAKE:
+            # Decode extension handshake
+            decoded, _ = bencode_decode(ext_payload)
+            self.extension_handshake_received = True
+
+            # Extract supported extensions
+            if isinstance(decoded, dict):
+                m = decoded.get("m", {})
+                if isinstance(m, dict):
+                    for ext_name, ext_id in m.items():
+                        if isinstance(ext_name, str) and isinstance(ext_id, int):
+                            self.remote_extensions[ext_name] = ext_id
+
+                # Extract metadata size if available
+                if "metadata_size" in decoded:
+                    self.metadata_size = decoded["metadata_size"]
+
+            return (ext_msg_id, decoded)
+        else:
+            # Other extension message - return raw payload
+            return (ext_msg_id, ext_payload)
+
+    async def request_metadata_piece(self, piece_index: int) -> None:
+        """
+        Request a metadata piece from peer (BEP 9).
+
+        Args:
+            piece_index: Index of the metadata piece to request
+        """
+        if "ut_metadata" not in self.remote_extensions:
+            raise PeerError("Peer does not support ut_metadata")
+
+        remote_ut_metadata_id = self.remote_extensions["ut_metadata"]
+
+        # Build request message
+        request_dict = {
+            "msg_type": ExtendedMessageType.REQUEST,
+            "piece": piece_index,
+        }
+
+        payload = bencode_encode(request_dict)
+        message = bytes([remote_ut_metadata_id]) + payload
+        await self.send_message(MessageType.EXTENDED, message)
+
+    def parse_metadata_response(self, payload: bytes) -> tuple[int, int, bytes | None]:
+        """
+        Parse a metadata response from peer.
+
+        Args:
+            payload: The metadata message payload (after extension message ID)
+
+        Returns:
+            Tuple of (msg_type, piece_index, data_or_none)
+            data_or_none is the metadata piece data for DATA messages, None for REJECT
+        """
+        # The payload is: <bencoded dict><raw metadata data>
+        # We need to find where the dict ends and data begins
+
+        decoded, end_pos = bencode_decode(payload)
+
+        if not isinstance(decoded, dict):
+            raise PeerError("Invalid metadata response format")
+
+        msg_type = decoded.get("msg_type", -1)
+        piece_index = decoded.get("piece", -1)
+
+        if msg_type == ExtendedMessageType.DATA:
+            # Data follows the bencoded dictionary
+            data = payload[end_pos:]
+            return (msg_type, piece_index, data)
+        elif msg_type == ExtendedMessageType.REJECT:
+            return (msg_type, piece_index, None)
+        else:
+            raise PeerError(f"Unknown metadata message type: {msg_type}")
+
+    async def connect_for_metadata(self, timeout: float = 10.0) -> bool:
+        """
+        Connect to peer with extension protocol support for metadata fetching.
+
+        Args:
+            timeout: Connection timeout in seconds
+
+        Returns:
+            True if connection successful and peer supports ut_metadata
+        """
+        try:
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.ip, self.port), timeout=timeout
+            )
+
+            # Perform handshake with extension support
+            await self._handshake(support_extensions=True)
+            self.connected = True
+
+            if not self.supports_extensions:
+                return False
+
+            # Send our extension handshake
+            await self.send_extension_handshake()
+
+            # Wait for their extension handshake
+            try:
+                msg_type, payload = await asyncio.wait_for(self.receive_message(), timeout=10.0)
+
+                if msg_type == MessageType.EXTENDED:
+                    await self.handle_extension_message(payload)
+                elif msg_type == MessageType.BITFIELD:
+                    await self.handle_bitfield(payload)
+                    # Try to get extension handshake next
+                    msg_type, payload = await asyncio.wait_for(self.receive_message(), timeout=10.0)
+                    if msg_type == MessageType.EXTENDED:
+                        await self.handle_extension_message(payload)
+            except TimeoutError:
+                pass
+
+            return "ut_metadata" in self.remote_extensions and self.metadata_size is not None
+
+        except TimeoutError:
+            await self._safe_close()
+            return False
+        except Exception:
+            await self._safe_close()
+            return False
+
+    async def fetch_metadata(self) -> bytes | None:
+        """
+        Fetch complete metadata from peer.
+
+        Returns:
+            Complete metadata bytes, or None if failed
+        """
+        if self.metadata_size is None:
+            return None
+
+        if "ut_metadata" not in self.remote_extensions:
+            return None
+
+        # Metadata is sent in 16KB pieces
+        piece_size = 16384
+        num_pieces = (self.metadata_size + piece_size - 1) // piece_size
+
+        metadata_pieces: dict[int, bytes] = {}
+
+        for piece_index in range(num_pieces):
+            # Request piece
+            await self.request_metadata_piece(piece_index)
+
+            # Wait for response
+            try:
+                while True:
+                    msg_type, payload = await asyncio.wait_for(self.receive_message(), timeout=30.0)
+
+                    if msg_type == MessageType.EXTENDED:
+                        ext_id = payload[0]
+                        ext_payload = payload[1:]
+
+                        # Check if this is a ut_metadata response
+                        if ext_id == self.remote_extensions.get("ut_metadata"):
+                            msg_type_meta, piece_idx, data = self.parse_metadata_response(ext_payload)
+
+                            if msg_type_meta == ExtendedMessageType.DATA and data:
+                                metadata_pieces[piece_idx] = data
+                                break
+                            elif msg_type_meta == ExtendedMessageType.REJECT:
+                                return None
+
+                    elif msg_type == MessageType.CHOKE:
+                        await self.handle_choke()
+                    elif msg_type == MessageType.UNCHOKE:
+                        await self.handle_unchoke()
+                    elif msg_type == MessageType.HAVE:
+                        await self.handle_have(payload)
+                    elif msg_type == MessageType.BITFIELD:
+                        await self.handle_bitfield(payload)
+
+            except TimeoutError:
+                return None
+            except Exception:
+                return None
+
+        # Assemble metadata
+        if len(metadata_pieces) != num_pieces:
+            return None
+
+        metadata = b""
+        for i in range(num_pieces):
+            metadata += metadata_pieces[i]
+
+        # Truncate to actual size (last piece may be padded)
+        metadata = metadata[: self.metadata_size]
+
+        # Verify hash
+        if hashlib.sha1(metadata).digest() != self.info_hash:
+            return None
+
+        return metadata

@@ -8,12 +8,14 @@ import sys
 from pathlib import Path
 
 from client import TorrentClient
+from magnet import is_magnet_link
+from magnet_client import create_parser_from_magnet
 
 
 async def main() -> None:
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(description="BitTorrent client for downloading torrents")
-    parser.add_argument("torrent", type=str, help="Path to .torrent file")
+    parser.add_argument("torrent", type=str, help="Path to .torrent file or magnet link")
     parser.add_argument(
         "-o",
         "--output",
@@ -34,14 +36,38 @@ async def main() -> None:
         handlers=[],  # No console output - TUI handles logs
     )
 
-    # Check if torrent file exists
-    torrent_path = Path(args.torrent)
-    if not torrent_path.exists():
-        print(f"Error: Torrent file not found: {args.torrent}", file=sys.stderr)
-        sys.exit(1)
+    # Check if input is a magnet link or torrent file
+    if is_magnet_link(args.torrent):
+        # Handle magnet link
+        print(f"Magnet link detected, fetching metadata...")
 
-    # Create client
-    client = TorrentClient(str(torrent_path), args.output)
+        # Enable console logging temporarily for metadata fetch
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter("%(message)s"))
+        logging.getLogger().addHandler(console_handler)
+
+        result = await create_parser_from_magnet(args.torrent)
+
+        if result is None:
+            print("Error: Failed to fetch torrent metadata from peers", file=sys.stderr)
+            sys.exit(1)
+
+        torrent_parser, info_hash = result
+
+        # Remove console handler before starting TUI
+        logging.getLogger().removeHandler(console_handler)
+
+        # Create client from parser
+        client = TorrentClient(parser=torrent_parser, output_dir=args.output, info_hash=info_hash)
+    else:
+        # Handle torrent file
+        torrent_path = Path(args.torrent)
+        if not torrent_path.exists():
+            print(f"Error: Torrent file not found: {args.torrent}", file=sys.stderr)
+            sys.exit(1)
+
+        # Create client
+        client = TorrentClient(torrent_path=str(torrent_path), output_dir=args.output)
 
     try:
         # Start client
