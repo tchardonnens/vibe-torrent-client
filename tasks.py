@@ -35,3 +35,9 @@ def check(ctx: Context) -> None:
     lint(ctx)
     format(ctx, check=True, fix=False)
     test(ctx)
+
+
+@task
+def mcp(ctx: Context, port: int = 8000) -> None:
+    """Run the FastMCP server with HTTP transport."""
+    ctx.run(f"cd src && uv run fastmcp run mcp_server/server.py --transport streamable-http --port {port}", pty=True)

@@ -7,13 +7,13 @@ This module initializes the FastMCP server and registers all tools and resources
 import sys
 from pathlib import Path
 
-from fastmcp import FastMCP
-
-from .resources import register_resources
-from .tools import register_all_tools
-
-# Add src to path for imports (needed for torrent_parser imports)
+# Add src to path for imports (needed for torrent_parser and mcp_server imports)
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from fastmcp import FastMCP  # noqa: E402
+
+from mcp_server.resources import register_resources  # noqa: E402
+from mcp_server.tools import register_all_tools  # noqa: E402
 
 # Initialize FastMCP server
 mcp = FastMCP(
