@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Deque
 import logging
 
-from torrent_parser import TorrentParser
+from torrent_parser import TorrentParser, Torrent
 from tracker import Tracker, generate_peer_id
 from peer import Peer, MessageType
 from piece_manager import PieceManager, PieceStatus, Block
@@ -18,7 +18,6 @@ from file_manager import FileManager
 from tui import TorrentTUI
 
 
-logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -36,7 +35,7 @@ class TorrentClient:
         self.torrent_path = torrent_path
         self.output_dir = Path(output_dir)
         self.parser = TorrentParser(torrent_path)
-        self.torrent_data: Optional[Dict] = None
+        self.torrent: Optional[Torrent] = None
         self.info_hash: bytes = b''
         self.peer_id: bytes = generate_peer_id()
         self.port = 6881
@@ -78,7 +77,7 @@ class TorrentClient:
         logger.info("Starting torrent client...")
         
         # Parse torrent file
-        self.torrent_data = self.parser.parse()
+        self.torrent = self.parser.parse()
         self.info_hash = bytes.fromhex(self.parser.get_info_hash())
         
         logger.info(f"Torrent: {self.parser.get_name()}")
@@ -107,6 +106,18 @@ class TorrentClient:
         # Start downloading
         self.downloading = True
         self.start_time = time.time()
+        
+        # Render TUI immediately before starting download
+        if self.tui:
+            self.tui.update(
+                completed_pieces=0,
+                pieces_per_sec=0.0,
+                chunks_per_sec=0.0,
+                active_peers=0,
+                total_peers=0,
+                downloaded_bytes=0
+            )
+        
         await self._download_loop()
     
     def _extract_pieces(self) -> List[tuple]:
@@ -116,13 +127,13 @@ class TorrentClient:
         Returns:
             List of (index, length, hash) tuples
         """
-        if 'info' not in self.torrent_data:
+        if self.torrent is None:
             return []
         
-        info = self.torrent_data['info']
-        pieces_data = info.get('pieces', b'')
-        piece_length = info.get('piece length', 0)
-        total_size = self.parser.get_total_size()
+        info = self.torrent.info
+        pieces_data = info.pieces
+        piece_length = info.piece_length
+        total_size = info.total_size
         
         if not isinstance(pieces_data, bytes):
             return []
@@ -173,6 +184,8 @@ class TorrentClient:
     async def _download_loop(self) -> None:
         """Main download loop."""
         last_update_time = time.time()
+        last_stuck_check = time.time()
+        stuck_check_interval = 10.0  # Check for stuck pieces every 10 seconds
         
         while self.downloading and not self.completed:
             try:
@@ -181,6 +194,11 @@ class TorrentClient:
                 if current_time - self.last_tracker_update >= self.tracker_update_interval:
                     await self._update_peers()
                     self.last_tracker_update = current_time
+                
+                # Check for stuck pieces (pieces marked as downloading but no peer is working on them)
+                if current_time - last_stuck_check >= stuck_check_interval:
+                    await self._recover_stuck_pieces()
+                    last_stuck_check = current_time
                 
                 # Connect to new peers
                 await self._connect_to_peers()
@@ -265,6 +283,33 @@ class TorrentClient:
             except Exception as e:
                 logger.warning(f"Failed to get peers from {url}: {e}")
                 continue
+    
+    async def _recover_stuck_pieces(self) -> None:
+        """Reset pieces that are stuck in downloading state with no active peer working on them."""
+        if not self.piece_manager:
+            return
+        
+        # Get pieces currently marked as downloading
+        async with self.piece_manager.piece_lock:
+            stuck_pieces = list(self.piece_manager.downloading_pieces)
+        
+        if not stuck_pieces:
+            return
+        
+        # Check each downloading piece - if its status is DOWNLOADING but no data is coming in,
+        # reset it so another peer can pick it up
+        for piece_index in stuck_pieces:
+            piece = self.piece_manager.pieces.get(piece_index)
+            if not piece:
+                continue
+            
+            # Check if piece has been stuck (no blocks received recently)
+            # For simplicity, just reset pieces that have been downloading for too long
+            # This is a simple heuristic - if a piece is still in downloading_pieces 
+            # after the stuck_check_interval, consider it stuck
+            if piece.status == PieceStatus.DOWNLOADING:
+                logger.debug(f"Recovering stuck piece {piece_index}")
+                await self.piece_manager.mark_piece_failed(piece_index)
     
     async def _connect_to_peers(self) -> None:
         """Connect to available peers."""

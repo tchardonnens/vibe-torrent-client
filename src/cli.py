@@ -34,12 +34,13 @@ async def main() -> None:
     
     args = parser.parse_args()
     
-    # Set logging level
+    # Set logging level (no handlers - TUI will handle display)
     import logging
-    if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(message)s",
+        handlers=[]  # No console output - TUI handles logs
+    )
     
     # Check if torrent file exists
     torrent_path = Path(args.torrent)
