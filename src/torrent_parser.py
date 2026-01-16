@@ -308,8 +308,8 @@ class TorrentParser:
             try:
                 value = int(data[index + 1 : end_index])
                 return value, end_index + 1
-            except ValueError:
-                raise BencodeError(f"Invalid integer at index {index}")
+            except ValueError as e:
+                raise BencodeError(f"Invalid integer at index {index}") from e
 
         # List: l<elements>e
         elif char == b"l":
@@ -344,8 +344,8 @@ class TorrentParser:
                 raise BencodeError(f"No colon found for string at index {index}")
             try:
                 length = int(data[index:colon_index])
-            except ValueError:
-                raise BencodeError(f"Invalid string length at index {index}")
+            except ValueError as e:
+                raise BencodeError(f"Invalid string length at index {index}") from e
 
             start_index = colon_index + 1
             end_index = start_index + length
@@ -369,12 +369,12 @@ class TorrentParser:
             Bencoded bytes
         """
         if isinstance(value, int):
-            return f"i{value}e".encode("utf-8")
+            return f"i{value}e".encode()
         elif isinstance(value, bytes):
-            return f"{len(value)}:".encode("utf-8") + value
+            return f"{len(value)}:".encode() + value
         elif isinstance(value, str):
             value_bytes = value.encode("utf-8")
-            return f"{len(value_bytes)}:".encode("utf-8") + value_bytes
+            return f"{len(value_bytes)}:".encode() + value_bytes
         elif isinstance(value, list):
             result = b"l"
             for item in value:

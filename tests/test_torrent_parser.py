@@ -1,7 +1,6 @@
 """Tests for the torrent parser module."""
 
 import hashlib
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -35,7 +34,10 @@ class TestBencodeDecoding:
     def test_decode_string(self, tmp_path: Path) -> None:
         """Test decoding of bencoded strings."""
         torrent_file = tmp_path / "test.torrent"
-        content = b"d8:announce17:http://tracker.io4:infod4:name8:testfile12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        content = (
+            b"d8:announce17:http://tracker.io4:infod4:name8:testfile"
+            b"12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        )
         torrent_file.write_bytes(content)
 
         parser = TorrentParser(torrent_file)
@@ -301,7 +303,10 @@ class TestTorrentParser:
         """Test parsing a single file torrent."""
         torrent_file = tmp_path / "single.torrent"
         # Single file torrent structure
-        content = b"d8:announce20:http://tracker.local4:infod6:lengthi1024e4:name8:test.txt12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        content = (
+            b"d8:announce20:http://tracker.local4:infod6:lengthi1024e4:name8:test.txt"
+            b"12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        )
         torrent_file.write_bytes(content)
 
         parser = TorrentParser(torrent_file)
@@ -315,8 +320,10 @@ class TestTorrentParser:
         """Test parsing a multi-file torrent."""
         torrent_file = tmp_path / "multi.torrent"
         # Multi-file torrent structure
-        # d4:infod5:filesld6:lengthi100e4:pathl5:a.txteed6:lengthi200e4:pathl5:b.txteee4:name6:folder12:piece lengthi16384e6:pieces20:01234567890123456789ee
-        content = b"d4:infod5:filesld6:lengthi100e4:pathl5:a.txteed6:lengthi200e4:pathl5:b.txteee4:name6:folder12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        content = (
+            b"d4:infod5:filesld6:lengthi100e4:pathl5:a.txteed6:lengthi200e4:pathl5:b.txteee"
+            b"4:name6:folder12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        )
         torrent_file.write_bytes(content)
 
         parser = TorrentParser(torrent_file)
@@ -471,7 +478,10 @@ class TestBencodeEncoding:
     def test_encode_decode_roundtrip(self, tmp_path: Path) -> None:
         """Test that encoding and decoding produces consistent results."""
         torrent_file = tmp_path / "test.torrent"
-        original_content = b"d8:announce20:http://tracker.local4:infod6:lengthi1024e4:name8:test.txt12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        original_content = (
+            b"d8:announce20:http://tracker.local4:infod6:lengthi1024e4:name8:test.txt"
+            b"12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        )
         torrent_file.write_bytes(original_content)
 
         parser = TorrentParser(torrent_file)

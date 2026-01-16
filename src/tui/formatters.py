@@ -35,6 +35,6 @@ def calculate_speed(downloaded_bytes: int, elapsed: float) -> str:
     """Calculate and format download speed."""
     if elapsed <= 0:
         return "0 B/s"
-    
+
     bytes_per_sec = downloaded_bytes / elapsed
     return f"{format_size(int(bytes_per_sec))}/s"
